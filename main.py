@@ -2,6 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from scipy.stats import shapiro
+
 import numpy as np
 import warnings
 
@@ -32,16 +35,15 @@ app.add_middleware(
 # REQUEST MODELS
 # ======================================================
 class ACFPACFRequest(BaseModel):
-    data: List[float]     # DATA SETELAH differencing FINAL
+    data: List[float]
     max_lag: int
 
 
 class SarimaEvalRequest(BaseModel):
-    data: List[float]     # DATA ASLI (BELUM differencing)
+    data: List[float]
     d: int
     D: int
     s: int
-
     max_p: int
     max_q: int
     max_P: int
@@ -54,9 +56,13 @@ class SarimaForecastRequest(BaseModel):
     seasonal_order: List[int]   # [P,D,Q,s]
     steps: int
 
+class ResidualDiagnosticRequest(BaseModel):
+    residuals: List[float]
+
+
 
 # ======================================================
-# HELPER (JSON SAFE)
+# HELPER
 # ======================================================
 def to_float(x):
     return float(x) if x is not None else None
@@ -67,7 +73,7 @@ def to_bool(x):
 
 
 # ======================================================
-# ACF & PACF ENDPOINT
+# ACF & PACF
 # ======================================================
 @app.post("/acf-pacf")
 def calculate_acf_pacf(req: ACFPACFRequest):
@@ -76,36 +82,32 @@ def calculate_acf_pacf(req: ACFPACFRequest):
     N = len(data)
 
     if N < req.max_lag + 1:
-        return {
-            "error": "Jumlah data terlalu sedikit",
-            "total_data": N
-        }
+        return {"error": "Data terlalu sedikit"}
 
-    # batas signifikansi 95%
-    significance_limit = float(1.96 / np.sqrt(N))
+    limit = float(1.96 / np.sqrt(N))
 
-    acf_values = acf(data, nlags=req.max_lag)
-    pacf_values = pacf(data, nlags=req.max_lag, method="ywm")
+    acf_vals = acf(data, nlags=req.max_lag)
+    pacf_vals = pacf(data, nlags=req.max_lag, method="ywm")
 
     result = []
     for lag in range(1, req.max_lag + 1):
         result.append({
             "lag": lag,
-            "acf": to_float(acf_values[lag]),
-            "acf_significant": to_bool(abs(acf_values[lag]) > significance_limit),
-            "pacf": to_float(pacf_values[lag]),
-            "pacf_significant": to_bool(abs(pacf_values[lag]) > significance_limit)
+            "acf": to_float(acf_vals[lag]),
+            "acf_significant": to_bool(abs(acf_vals[lag]) > limit),
+            "pacf": to_float(pacf_vals[lag]),
+            "pacf_significant": to_bool(abs(pacf_vals[lag]) > limit)
         })
 
     return {
         "total_data": N,
-        "significance_limit": significance_limit,
+        "significance_limit": limit,
         "result": result
     }
 
 
 # ======================================================
-# SARIMA EVALUATION (GRID SEARCH)
+# SARIMA EVALUATION (GRID SEARCH + RESIDUAL)
 # ======================================================
 @app.post("/sarima-evaluate")
 def sarima_evaluate(req: SarimaEvalRequest):
@@ -159,8 +161,7 @@ def sarima_evaluate(req: SarimaEvalRequest):
                                 "RMSE": rmse
                             })
 
-                    except Exception as e:
-                        print(f"GAGAL SARIMA({p},{q},{P},{Q}) -> {e}")
+                    except Exception:
                         continue
 
     if not results:
@@ -169,11 +170,31 @@ def sarima_evaluate(req: SarimaEvalRequest):
             "total_model": 0
         }
 
+    # ===============================
+    # PILIH MODEL TERBAIK
+    # ===============================
     results.sort(key=lambda x: x["AIC"])
+    best = results[0]
+
+    # ===============================
+    # FIT ULANG MODEL TERBAIK
+    # ===============================
+    model_best = SARIMAX(
+        y,
+        order=(best["p"], best["d"], best["q"]),
+        seasonal_order=(best["P"], best["D"], best["Q"], best["s"]),
+        simple_differencing=False,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+
+    fitted_best = model_best.fit(disp=False)
+    residuals = fitted_best.resid.tolist()
 
     return {
         "total_model": len(results),
-        "best_model": results[0],
+        "best_model": best,
+        "residuals": residuals,
         "all_models": results
     }
 
@@ -202,35 +223,80 @@ def forecast_sarima(req: SarimaForecastRequest):
             detail="seasonal_order harus [P,D,Q,s]"
         )
 
-    try:
-        series = np.array(req.data, dtype=float)
+    series = np.array(req.data, dtype=float)
 
-        model = SARIMAX(
-            series,
-            order=tuple(req.order),
-            seasonal_order=tuple(req.seasonal_order),
-            simple_differencing=False,
-            enforce_stationarity=False,
-            enforce_invertibility=False
-        )
+    model = SARIMAX(
+        series,
+        order=tuple(req.order),
+        seasonal_order=tuple(req.seasonal_order),
+        simple_differencing=False,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
 
-        fitted = model.fit(disp=False)
+    fitted = model.fit(disp=False)
+    forecast = fitted.forecast(steps=req.steps)
 
-        forecast = fitted.forecast(steps=req.steps)
+    return {
+        "forecast": forecast.round(2).tolist()
+    }
 
-        return {
-            "forecast": forecast.round(2).tolist()
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"SARIMA error: {str(e)}"
-        )
 
 
 # ======================================================
-# ROOT CHECK
+# RESIDUAL DIAGNOSTIC (WHITE NOISE & NORMALITY)
+# ======================================================
+@app.post("/diagnostic-residual")
+def diagnostic_residual(req: ResidualDiagnosticRequest):
+
+    residuals = np.array(req.residuals, dtype=float)
+
+    if len(residuals) < 20:
+        return {
+            "error": "Jumlah residual terlalu sedikit untuk uji statistik"
+        }
+
+    # ===============================
+    # WHITE NOISE - Ljung Box
+    # ===============================
+    lb = acorr_ljungbox(residuals, lags=[10], return_df=True)
+    lb_pvalue = float(lb["lb_pvalue"].iloc[0])
+    white_noise = lb_pvalue > 0.05
+
+    # ===============================
+    # NORMALITY - Shapiro Wilk
+    # ===============================
+    _, shapiro_pvalue = shapiro(residuals)
+    normal = shapiro_pvalue > 0.05
+
+    # ===============================
+    # KESIMPULAN
+    # ===============================
+    if white_noise and normal:
+        conclusion = "Residual bersifat white noise dan berdistribusi normal. Model SARIMA layak digunakan."
+    elif white_noise:
+        conclusion = "Residual bersifat white noise namun tidak sepenuhnya normal. Model masih layak untuk prediksi jangka pendek."
+    else:
+        conclusion = "Residual tidak bersifat white noise. Model SARIMA perlu diperbaiki."
+
+    return {
+        "white_noise_test": {
+            "method": "Ljung-Box",
+            "p_value": round(lb_pvalue, 6),
+            "result": "LULUS" if white_noise else "TIDAK LULUS"
+        },
+        "normality_test": {
+            "method": "Shapiro-Wilk",
+            "p_value": round(shapiro_pvalue, 6),
+            "result": "LULUS" if normal else "TIDAK LULUS"
+        },
+        "conclusion": conclusion
+    }
+
+
+
+# ======================================================
+# ROOT
 # ======================================================
 @app.get("/")
 def root():
@@ -239,6 +305,7 @@ def root():
         "endpoints": [
             "/acf-pacf",
             "/sarima-evaluate",
+            "/diagnostic-residual",
             "/forecast"
         ]
     }
